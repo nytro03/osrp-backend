@@ -14,86 +14,127 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Vars Twitch
+// ─────────────────────────────────────────────────────────────
+// ENV
 const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
 const TWITCH_SECRET    = process.env.TWITCH_SECRET;
+const TWITCH_MAX_PAGES = parseInt(process.env.TWITCH_MAX_PAGES || "8", 10); // ~8*100 = 800 streams
 
-// Health
+// Regex large : "osrp" ou "old school rp" (tolère espaces multiples, casse ignorée)
+const OSRP_RE = /osrp|old\s*school\s*rp/i;
+
+// ─────────────────────────────────────────────────────────────
+// Health check
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, hasClientId: !!TWITCH_CLIENT_ID, hasSecret: !!TWITCH_SECRET });
+  res.json({
+    ok: true,
+    hasClientId: !!TWITCH_CLIENT_ID,
+    hasSecret: !!TWITCH_SECRET,
+    maxPages: TWITCH_MAX_PAGES
+  });
 });
 
-// OAuth Twitch
+// ─────────────────────────────────────────────────────────────
+// OAuth
 async function getTwitchToken() {
   if (!TWITCH_CLIENT_ID || !TWITCH_SECRET) return null;
   const url = `https://id.twitch.tv/oauth2/token?client_id=${TWITCH_CLIENT_ID}&client_secret=${TWITCH_SECRET}&grant_type=client_credentials`;
   const r = await fetch(url, { method: "POST" });
-  if (!r.ok) return null;
+  if (!r.ok) {
+    const t = await r.text().catch(()=>"");
+    console.warn("Twitch token error:", r.status, t);
+    return null;
+  }
   const data = await r.json();
   return data.access_token;
 }
 
-// Streams Twitch (recherche + filtre)
+// ─────────────────────────────────────────────────────────────
+// Balaye helix/streams en pagination et filtre par titre OSRP
 async function getTwitchStreams() {
   const token = await getTwitchToken();
-  if (!token) return []; // Pas de clés → on n'échoue pas
+  if (!token) return [];
 
-  const headers = { "Client-ID": TWITCH_CLIENT_ID, "Authorization": `Bearer ${token}` };
-  const queries = ["osrp", "oldschoolrp", "old school rp"];
-  const found = new Map();
+  const headers = {
+    "Client-Id": TWITCH_CLIENT_ID,
+    "Authorization": `Bearer ${token}`,
+  };
 
-  for (const q of queries) {
-    const r = await fetch(`https://api.twitch.tv/helix/search/channels?query=${encodeURIComponent(q)}&live_only=true`, { headers });
-    if (!r.ok) continue;
+  const results = [];
+  let cursor = null;
+
+  for (let page = 0; page < TWITCH_MAX_PAGES; page++) {
+    const url = new URL("https://api.twitch.tv/helix/streams");
+    url.searchParams.set("first", "100");
+    if (cursor) url.searchParams.set("after", cursor);
+
+    const r = await fetch(url, { headers });
+    if (!r.ok) {
+      const t = await r.text().catch(()=>"");
+      console.warn("helix/streams error:", r.status, t);
+      break;
+    }
     const data = await r.json();
-    (data.data || []).forEach(ch => { if (ch.is_live) found.set(ch.broadcaster_login, ch.display_name); });
+    const items = Array.isArray(data.data) ? data.data : [];
+
+    for (const s of items) {
+      if (OSRP_RE.test(s.title || "")) {
+        results.push({
+          platform : "twitch",
+          name     : s.user_name,
+          title    : s.title,
+          thumbnail: (s.thumbnail_url || "").replace("{width}","640").replace("{height}","360"),
+          url      : `https://twitch.tv/${s.user_login}`,
+          viewers  : s.viewer_count
+        });
+      }
+    }
+
+    cursor = data?.pagination?.cursor || null;
+    if (!cursor || items.length === 0) break; // plus de pages
   }
-  if (found.size === 0) return [];
 
-  const logins = Array.from(found.keys());
-  const qs     = logins.map(l => `user_login=${encodeURIComponent(l)}`).join("&");
-  const r2     = await fetch(`https://api.twitch.tv/helix/streams?${qs}`, { headers });
-  if (!r2.ok) return [];
-  const data2  = await r2.json();
-
-  const re = /osrp|old\s*school\s*rp/i;
-  return (data2.data || [])
-    .filter(s => re.test(s.title))
-    .map(s => ({
-      platform : "twitch",
-      name     : s.user_name,
-      title    : s.title,
-      thumbnail: s.thumbnail_url.replace("{width}","640").replace("{height}","360"),
-      url      : `https://twitch.tv/${s.user_login}`,
-      viewers  : s.viewer_count
-    }));
+  // déduplique par login (URL unique)
+  const uniq = new Map();
+  for (const s of results) {
+    const key = (s.url || "").toLowerCase();
+    if (key && !uniq.has(key)) uniq.set(key, s);
+  }
+  return Array.from(uniq.values());
 }
 
-// TikTok placeholder
-async function getTiktokStreams() { return []; }
+// TikTok (placeholder pour l’instant)
+async function getTiktokStreams() {
+  return []; // à brancher plus tard si besoin
+}
 
-// API streams (n'échoue jamais)
+// ─────────────────────────────────────────────────────────────
+// API : n'échoue jamais (retourne [] en cas de problème)
 app.get("/streams", async (_req, res) => {
   const out = [];
   try {
     const [tw, tt] = await Promise.allSettled([getTwitchStreams(), getTiktokStreams()]);
     if (tw.status === "fulfilled") out.push(...tw.value);
     if (tt.status === "fulfilled") out.push(...tt.value);
-  } catch {}
+  } catch (e) {
+    console.warn("streams aggregation error:", e);
+  }
   res.json(out);
 });
 
-// ✅ Sert les fichiers statiques
+// ─────────────────────────────────────────────────────────────
+// Fichiers statiques + racine
 app.use(express.static(path.join(__dirname, "public")));
-
-// ✅ Route racine renvoie index.html
 app.get("/", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-// (Optionnel) SPA fallback (toutes autres routes → index)
+// (Optionnel) fallback SPA
 app.get("*", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-app.listen(PORT, () => console.log(`✅ Backend & Web en ligne sur port ${PORT}`));
+// ─────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`✅ Backend & Web en ligne sur port ${PORT}`);
+});
