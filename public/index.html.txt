@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Live Streamers OSRP</title>
+  <style>
+    :root { --twitch: #9146FF; --tiktok: #000; }
+    * { box-sizing: border-box; }
+    body { font-family: Arial, Helvetica, sans-serif; background:#0f0f10; color:#f4f4f5; margin:0; }
+    header { background: linear-gradient(90deg, var(--twitch), var(--tiktok)); padding:20px; text-align:center; font-size:22px; font-weight:800; }
+    .toolbar { display:flex; gap:10px; justify-content:center; align-items:center; padding:12px; }
+    .toolbar button { background:#222; color:#fff; border:1px solid #333; padding:8px 14px; border-radius:8px; cursor:pointer; }
+    .toolbar button:hover { background:#2c2c2c; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px; padding:18px; max-width:1200px; margin:0 auto; }
+    .card { background:#17171a; border:1px solid #26262b; border-radius:12px; overflow:hidden; box-shadow:0 6px 18px rgba(0,0,0,.35); opacity:0; transform:translateY(10px); transition:opacity .35s, transform .35s; }
+    .card.show { opacity:1; transform:translateY(0); }
+    .thumb { width:100%; aspect-ratio:16/9; object-fit:cover; background:#0b0b0c; display:block; }
+    .content { padding:12px 14px 16px; }
+    .platform { display:inline-flex; align-items:center; font-size:12px; font-weight:700; padding:4px 8px; border-radius:999px; margin-bottom:8px; border:1px solid rgba(255,255,255,.2); }
+    .platform.twitch { background:rgba(145,70,255,.15); color:#c7a7ff; border-color:rgba(145,70,255,.35); }
+    .platform.tiktok { background:rgba(255,255,255,.08); color:#fff; }
+    .title { font-size:16px; font-weight:800; margin:6px 0 6px; }
+    .user { font-size:13px; color:#c9cad1; margin:0 0 6px; }
+    .meta { font-size:12px; color:#a7a8ae; }
+    .card a { text-decoration:none; color:inherit; display:block; }
+    .badge-live { position:absolute; top:10px; left:10px; background:#e11d48; color:#fff; font-size:12px; font-weight:800; padding:4px 8px; border-radius:6px; }
+    .wrap { position:relative; }
+    .state { text-align:center; color:#c9cad1; padding:24px 16px 40px; }
+    footer { text-align:center; color:#7b7c85; font-size:12px; padding:8px 0 18px; }
+  </style>
+</head>
+<body>
+  <header>🎥 Streamers OSRP / OldSchoolRP en direct</header>
+
+  <div class="toolbar">
+    <button id="refreshBtn">🔄 Actualiser</button>
+  </div>
+
+  <div id="state" class="state">Chargement des streams...</div>
+  <section id="grid" class="grid" aria-live="polite"></section>
+
+  <footer>Auto-refresh 60s • Source: <code>/streams</code></footer>
+
+  <script>
+    const grid  = document.getElementById("grid");
+    const state = document.getElementById("state");
+    const btn   = document.getElementById("refreshBtn");
+
+    function render(streams) {
+      grid.innerHTML = "";
+      if (!streams || streams.length === 0) {
+        state.textContent = "Aucun live en cours 🎮";
+        return;
+      }
+      state.textContent = "";
+
+      // Tri par viewers décroissant
+      streams.sort((a,b) => (b.viewers||0) - (a.viewers||0));
+
+      streams.forEach(s => {
+        const card = document.createElement("article");
+        card.className = "card";
+        const platform = (s.platform||"").toLowerCase();
+        const viewers  = (s.viewers ?? 0).toLocaleString("fr-FR");
+        const title    = s.title || "Live en cours";
+        const name     = s.name  || s.username || "Streamer";
+        const thumb    = s.thumbnail || "";
+        const url      = s.url || "#";
+
+        card.innerHTML = `
+          <a href="${url}" target="_blank" rel="noopener">
+            <div class="wrap">
+              <span class="badge-live">EN DIRECT</span>
+              <img class="thumb" src="${thumb}" alt="Miniature du live de ${name}">
+            </div>
+            <div class="content">
+              <span class="platform ${platform}">${platform.toUpperCase()}</span>
+              <h3 class="title">${title}</h3>
+              <p class="user">par ${name}</p>
+              <p class="meta">👀 ${viewers} spectateurs</p>
+            </div>
+          </a>
+        `;
+        grid.appendChild(card);
+        requestAnimationFrame(() => card.classList.add("show"));
+      });
+    }
+
+    async function load() {
+      state.textContent = "Chargement des streams...";
+      grid.innerHTML = "";
+      try {
+        const res  = await fetch("/streams");   // même domaine -> pas de CORS
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        render(data);
+      } catch (e) {
+        console.error(e);
+        state.textContent = "Erreur lors du chargement des streams ❌";
+      }
+    }
+
+    btn.addEventListener("click", load);
+    load();
+    setInterval(load, 60000);
+  </script>
+</body>
+</html>
