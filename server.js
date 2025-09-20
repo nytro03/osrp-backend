@@ -1,4 +1,4 @@
-// server.js — MODE DIAGNOSTIC
+// server.js — OSRP streams (Twitch deep scan + whitelist + debug)
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -14,15 +14,24 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// ─────────────────────────────────────────────────────────────
 // ENV
 const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
 const TWITCH_SECRET    = process.env.TWITCH_SECRET;
-const TWITCH_MAX_PAGES = parseInt(process.env.TWITCH_MAX_PAGES || "50", 10); // ↑ profondeur pour test
 
-// Regex ultra-large : OSRP, OS RP, O.S.R.P, old school rp, oldschool rp, osrpfr…
+// profondeur du scan: 100 pages = ~10 000 lives
+const TWITCH_MAX_PAGES = parseInt(process.env.TWITCH_MAX_PAGES || "100", 10);
+
+// Whitelist de logins Twitch (séparés par virgule): "login1,login2"
+const WHITELIST_LOGINS = (process.env.WHITELIST_LOGINS || "")
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// Regex ULTRA-large (OSRP, OS RP, O.S.R.P, old school rp, oldschool rp, osrpfr, etc.)
 const OSRP_RE = new RegExp(
   [
-    "o\\s*\\.?\\s*s\\s*\\.?\\s*r\\s*\\.?\\s*p", // OSRP, OS RP, O.S.R.P
+    "o\\s*\\.?\\s*s\\s*\\.?\\s*r\\s*\\.?\\s*p", // OSRP / OS RP / O.S.R.P
     "old\\s*school\\s*r\\s*p",                 // old school rp
     "oldschool\\s*r\\s*p",                     // oldschool rp
     "osrp\\w*"                                 // osrpfr, osrp_, etc.
@@ -30,13 +39,15 @@ const OSRP_RE = new RegExp(
   "i"
 );
 
-// Health
+// ─────────────────────────────────────────────────────────────
+// Health (diagnostic rapide)
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     hasClientId: !!TWITCH_CLIENT_ID,
     hasSecret: !!TWITCH_SECRET,
-    maxPages: TWITCH_MAX_PAGES
+    maxPages: TWITCH_MAX_PAGES,
+    whitelist: WHITELIST_LOGINS
   });
 });
 
@@ -53,20 +64,18 @@ async function getTwitchToken() {
   return data.access_token;
 }
 
-// Scan helix/streams en pagination + logs par page
-async function getTwitchStreams({ collectSample=false } = {}) {
+// Deep scan global de helix/streams + filtre titre OSRP + union whitelist
+async function getTwitchStreams() {
   const token = await getTwitchToken();
-  if (!token) return { results: [], sample: [] };
+  if (!token) return [];
 
+  // Headers officiels (casse exacte)
   const headers = {
-    // certaines implémentations préfèrent "Client-ID", d’autres "Client-Id" — on met les deux
-    "Client-ID": TWITCH_CLIENT_ID,
     "Client-Id": TWITCH_CLIENT_ID,
     "Authorization": `Bearer ${token}`,
   };
 
   const results = [];
-  const sample  = []; // pour /debug-sample
   let cursor = null;
 
   for (let page = 0; page < TWITCH_MAX_PAGES; page++) {
@@ -82,19 +91,16 @@ async function getTwitchStreams({ collectSample=false } = {}) {
     const data = await r.json();
     const items = Array.isArray(data.data) ? data.data : [];
 
-    // remplir l’échantillon (premiers 50 titres scannés)
-    if (collectSample && sample.length < 50) {
-      for (const s of items) {
-        if (sample.length >= 50) break;
-        sample.push({ title: s.title, user: s.user_name, lang: s.language, viewers: s.viewer_count });
-      }
-    }
-
-    // filtrage par titre OSRP
     let pageMatches = 0;
+
     for (const s of items) {
       const title = s.title || "";
-      if (OSRP_RE.test(title)) {
+      const login = (s.user_login || "").toLowerCase();
+
+      const isWhitelisted = WHITELIST_LOGINS.includes(login);
+      const matchesTitle  = OSRP_RE.test(title);
+
+      if (isWhitelisted || matchesTitle) {
         results.push({
           platform : "twitch",
           name     : s.user_name,
@@ -104,56 +110,69 @@ async function getTwitchStreams({ collectSample=false } = {}) {
           viewers  : s.viewer_count,
           language : s.language
         });
-        pageMatches++;
+        if (matchesTitle) pageMatches++;
       }
     }
 
     console.log(`Page ${page+1}: ${items.length} streams scannés, ${pageMatches} match OSRP`);
 
     cursor = data?.pagination?.cursor || null;
-    if (!cursor || items.length === 0) break;
+    if (!cursor || items.length === 0) break; // fin
   }
 
-  // déduplique par URL
+  // Déduplique par URL (login)
   const uniq = new Map();
   for (const s of results) {
     const key = (s.url || "").toLowerCase();
     if (key && !uniq.has(key)) uniq.set(key, s);
   }
 
-  return { results: Array.from(uniq.values()), sample };
+  // Tri par viewers décroissant (utile pour l’affichage)
+  return Array.from(uniq.values()).sort((a, b) => (b.viewers || 0) - (a.viewers || 0));
 }
 
-// TikTok (placeholder)
-async function getTiktokStreams() { return []; }
+// TikTok — placeholder (tu peux brancher plus tard)
+async function getTiktokStreams() {
+  return [];
+}
 
-// API principale — n’échoue jamais
+// API principale — n’échoue jamais (au pire renvoie [])
 app.get("/streams", async (_req, res) => {
   try {
-    const [{ results: tw }, tt] = await Promise.all([
-      getTwitchStreams(),
-      getTiktokStreams()
-    ]);
-    res.json([...(tw || []), ...(tt || [])]);
+    const [tw, tt] = await Promise.allSettled([getTwitchStreams(), getTiktokStreams()]);
+    const out = [
+      ...(tw.status === "fulfilled" ? tw.value : []),
+      ...(tt.status === "fulfilled" ? tt.value : []),
+    ];
+    res.json(out);
   } catch (e) {
     console.warn("streams aggregation error:", e);
     res.json([]);
   }
 });
 
-// Debug : combien trouvés + échantillon
-app.get("/debug-osrp", async (_req, res) => {
-  const { results } = await getTwitchStreams();
-  res.json({ count: results.length, sample: results.slice(0, 10) });
-});
-
-// Debug : premiers titres scannés (pour vérifier que le scan marche)
+// Debug: premiers titres scannés (preuve que le scan tourne)
 app.get("/debug-sample", async (_req, res) => {
-  const { sample } = await getTwitchStreams({ collectSample: true });
-  res.json({ scannedSampleCount: sample.length, sample });
+  const token = await getTwitchToken();
+  if (!token) return res.json({ error: "no token" });
+
+  const headers = { "Client-Id": TWITCH_CLIENT_ID, "Authorization": `Bearer ${token}` };
+  const url = new URL("https://api.twitch.tv/helix/streams");
+  url.searchParams.set("first", "100");
+  const r = await fetch(url, { headers });
+  if (!r.ok) return res.json({ error: "streams error", status: r.status });
+  const data = await r.json();
+  const items = Array.isArray(data.data) ? data.data : [];
+  res.json({ scannedSampleCount: items.length, sample: items.slice(0, 50).map(s => ({ title: s.title, user: s.user_name, lang: s.language })) });
 });
 
-// Static + root
+// Debug: résultats OSRP (count + sample)
+app.get("/debug-osrp", async (_req, res) => {
+  const data = await getTwitchStreams();
+  res.json({ count: data.length, sample: data.slice(0, 10) });
+});
+
+// Fichiers statiques + racine
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
