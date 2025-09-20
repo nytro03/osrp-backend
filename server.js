@@ -1,4 +1,4 @@
-// server.js
+// server.js — MODE DIAGNOSTIC
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -14,35 +14,29 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─────────────────────────────────────────────────────────────
 // ENV
-const TWITCH_CLIENT_ID   = process.env.TWITCH_CLIENT_ID;
-const TWITCH_SECRET      = process.env.TWITCH_SECRET;
-const TWITCH_MAX_PAGES   = parseInt(process.env.TWITCH_MAX_PAGES || "25", 10);  // ↑ profondeur
-const TWITCH_LANGUAGE    = (process.env.TWITCH_LANGUAGE || "").trim().toLowerCase(); // ex: "fr"
-const TWITCH_GAME_IDS    = (process.env.TWITCH_GAME_IDS || "").split(",").map(s=>s.trim()).filter(Boolean); // ex: "32982,491318" (GTA V, FiveM)
+const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
+const TWITCH_SECRET    = process.env.TWITCH_SECRET;
+const TWITCH_MAX_PAGES = parseInt(process.env.TWITCH_MAX_PAGES || "50", 10); // ↑ profondeur pour test
 
-// Regex UBER-large : osrp / os rp / o.s.r.p / osrpfr / old school rp / oldschool rp
+// Regex ultra-large : OSRP, OS RP, O.S.R.P, old school rp, oldschool rp, osrpfr…
 const OSRP_RE = new RegExp(
   [
-    "o\\s*\\.?\\s*s\\s*\\.?\\s*r\\s*\\.?\\s*p",   // OSRP sous toutes les formes (OS RP, O.S.R.P, etc.)
-    "old\\s*school\\s*r\\s*p",                   // old school rp (tolère espaces)
-    "oldschool\\s*r\\s*p",                       // oldschool rp
-    "osrp\\w*"                                   // osrpfr, osrp_...
+    "o\\s*\\.?\\s*s\\s*\\.?\\s*r\\s*\\.?\\s*p", // OSRP, OS RP, O.S.R.P
+    "old\\s*school\\s*r\\s*p",                 // old school rp
+    "oldschool\\s*r\\s*p",                     // oldschool rp
+    "osrp\\w*"                                 // osrpfr, osrp_, etc.
   ].join("|"),
   "i"
 );
 
-// ─────────────────────────────────────────────────────────────
 // Health
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     hasClientId: !!TWITCH_CLIENT_ID,
     hasSecret: !!TWITCH_SECRET,
-    maxPages: TWITCH_MAX_PAGES,
-    language: TWITCH_LANGUAGE || null,
-    gameIds: TWITCH_GAME_IDS
+    maxPages: TWITCH_MAX_PAGES
   });
 });
 
@@ -51,39 +45,53 @@ async function getTwitchToken() {
   if (!TWITCH_CLIENT_ID || !TWITCH_SECRET) return null;
   const url = `https://id.twitch.tv/oauth2/token?client_id=${TWITCH_CLIENT_ID}&client_secret=${TWITCH_SECRET}&grant_type=client_credentials`;
   const r = await fetch(url, { method: "POST" });
-  if (!r.ok) return null;
+  if (!r.ok) {
+    console.warn("Twitch token error:", r.status, await r.text().catch(()=> ""));
+    return null;
+  }
   const data = await r.json();
   return data.access_token;
 }
 
-// Scan helix/streams en pagination + filtres langue/jeux + regex titre
-async function getTwitchStreams() {
+// Scan helix/streams en pagination + logs par page
+async function getTwitchStreams({ collectSample=false } = {}) {
   const token = await getTwitchToken();
-  if (!token) return [];
+  if (!token) return { results: [], sample: [] };
 
   const headers = {
+    // certaines implémentations préfèrent "Client-ID", d’autres "Client-Id" — on met les deux
+    "Client-ID": TWITCH_CLIENT_ID,
     "Client-Id": TWITCH_CLIENT_ID,
     "Authorization": `Bearer ${token}`,
   };
 
   const results = [];
+  const sample  = []; // pour /debug-sample
   let cursor = null;
 
   for (let page = 0; page < TWITCH_MAX_PAGES; page++) {
     const url = new URL("https://api.twitch.tv/helix/streams");
     url.searchParams.set("first", "100");
     if (cursor) url.searchParams.set("after", cursor);
-    // filtre langue pour réduire le bruit et pousser plus deep
-    if (TWITCH_LANGUAGE) url.searchParams.set("language", TWITCH_LANGUAGE);
-    // filtre jeu si fourni (réduit énormément le bruit si tu connais vos catégories)
-    for (const gid of TWITCH_GAME_IDS) url.searchParams.append("game_id", gid);
 
     const r = await fetch(url, { headers });
-    if (!r.ok) break;
-
+    if (!r.ok) {
+      console.warn("helix/streams error:", r.status, await r.text().catch(()=> ""));
+      break;
+    }
     const data = await r.json();
     const items = Array.isArray(data.data) ? data.data : [];
 
+    // remplir l’échantillon (premiers 50 titres scannés)
+    if (collectSample && sample.length < 50) {
+      for (const s of items) {
+        if (sample.length >= 50) break;
+        sample.push({ title: s.title, user: s.user_name, lang: s.language, viewers: s.viewer_count });
+      }
+    }
+
+    // filtrage par titre OSRP
+    let pageMatches = 0;
     for (const s of items) {
       const title = s.title || "";
       if (OSRP_RE.test(title)) {
@@ -94,56 +102,61 @@ async function getTwitchStreams() {
           thumbnail: (s.thumbnail_url || "").replace("{width}","640").replace("{height}","360"),
           url      : `https://twitch.tv/${s.user_login}`,
           viewers  : s.viewer_count,
-          language : s.language,
-          game_id  : s.game_id
+          language : s.language
         });
+        pageMatches++;
       }
     }
+
+    console.log(`Page ${page+1}: ${items.length} streams scannés, ${pageMatches} match OSRP`);
 
     cursor = data?.pagination?.cursor || null;
     if (!cursor || items.length === 0) break;
   }
 
-  // déduplique par login (URL unique)
+  // déduplique par URL
   const uniq = new Map();
   for (const s of results) {
     const key = (s.url || "").toLowerCase();
     if (key && !uniq.has(key)) uniq.set(key, s);
   }
-  return Array.from(uniq.values());
+
+  return { results: Array.from(uniq.values()), sample };
 }
 
-// TikTok placeholder
+// TikTok (placeholder)
 async function getTiktokStreams() { return []; }
 
-// API — n’échoue jamais
+// API principale — n’échoue jamais
 app.get("/streams", async (_req, res) => {
-  const out = [];
   try {
-    const [tw, tt] = await Promise.allSettled([getTwitchStreams(), getTiktokStreams()]);
-    if (tw.status === "fulfilled") out.push(...tw.value);
-    if (tt.status === "fulfilled") out.push(...tt.value);
-  } catch {}
-  res.json(out);
+    const [{ results: tw }, tt] = await Promise.all([
+      getTwitchStreams(),
+      getTiktokStreams()
+    ]);
+    res.json([...(tw || []), ...(tt || [])]);
+  } catch (e) {
+    console.warn("streams aggregation error:", e);
+    res.json([]);
+  }
 });
 
-// DEBUG : petite aide visuelle (combien scannés / premiers titres matchés)
+// Debug : combien trouvés + échantillon
 app.get("/debug-osrp", async (_req, res) => {
-  const data = await getTwitchStreams();
-  res.json({
-    count: data.length,
-    sample: data.slice(0, 10)
-  });
+  const { results } = await getTwitchStreams();
+  res.json({ count: results.length, sample: results.slice(0, 10) });
+});
+
+// Debug : premiers titres scannés (pour vérifier que le scan marche)
+app.get("/debug-sample", async (_req, res) => {
+  const { sample } = await getTwitchStreams({ collectSample: true });
+  res.json({ scannedSampleCount: sample.length, sample });
 });
 
 // Static + root
 app.use(express.static(path.join(__dirname, "public")));
-app.get("/", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-app.get("*", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
+app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
+app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
 app.listen(PORT, () => {
   console.log(`✅ Backend & Web en ligne sur port ${PORT}`);
